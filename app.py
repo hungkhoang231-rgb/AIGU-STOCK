@@ -2,151 +2,183 @@ import streamlit as st
 import yfinance as yf
 import pandas_ta as ta
 import google.generativeai as genai
-from duckduckgo_search import DDGS
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
 from datetime import datetime
-import time
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="AI 美股超賣獵手", page_icon="📉", layout="wide")
+st.set_page_config(page_title="AI 美股技術分析戰情室", page_icon="📈", layout="wide")
 
-# --- 側邊欄：設定與敏感資訊 ---
+# --- 側邊欄：API 設定 ---
 with st.sidebar:
     st.header("⚙️ 系統設定")
-    
-    # 嘗試從 Streamlit Secrets 讀取 Key，如果沒有則顯示輸入框
     if 'GEMINI_API_KEY' in st.secrets:
         GEMINI_API_KEY = st.secrets['GEMINI_API_KEY']
-        st.success("API Key 已從系統安全載入")
+        st.success("API Key 已載入")
     else:
-        GEMINI_API_KEY = st.text_input("Gemini API Key", type="password")
+        GEMINI_API_KEY = st.text_input("輸入 Gemini API Key", type="password")
 
-    if 'GMAIL_USER' in st.secrets:
-        GMAIL_USER = st.secrets['GMAIL_USER']
-        GMAIL_PASSWORD = st.secrets['GMAIL_PASSWORD']
-        st.success("Gmail 帳密已從系統安全載入")
-    else:
-        st.divider()
-        st.info("若未設定 Secrets，請手動輸入：")
-        GMAIL_USER = st.text_input("您的 Gmail 地址")
-        GMAIL_PASSWORD = st.text_input("Gmail 應用程式密碼", type="password")
-    
-    TARGET_EMAIL = st.text_input("接收報告的 Email", value=GMAIL_USER)
+# --- 您的策略邏輯 (作為 AI 的系統提示詞) ---
+STRATEGY_CONTEXT = """
+你是專業的美股技術分析師。請嚴格根據以下策略邏輯進行分析，不要使用外部不明確的指標。
 
-# --- 主畫面 ---
-st.title("📉 AI 美股超賣偵測與分析系統")
-st.markdown("此系統利用 **Yahoo Finance** 公開數據掃描市場，並結合 **Gemini AI** 進行深度分析。")
+【技術指標規則】
+1. K線型態：
+   - 買進：低檔長下影線(錘子)、實體大紅K(無上影)、W底/頭肩底突破。
+   - 賣出：高檔長上影線(射擊之星)、實體大黑K(無下影)、M頭/頭肩頂跌破。
+2. 價量關係：
+   - 價漲量增：多頭健康 (買)。
+   - 價漲量縮：追價意願低 (賣/風險)。
+3. KD指標：
+   - 黃金交叉 (K向上穿過D) 且數值 < 20：強烈買訊。
+   - 死亡交叉 (K向下跌破D) 且數值 > 80：強烈賣訊。
+4. 布林通道 (20MA, 2std)：
+   - 買進：跌破下軌後收紅K重回軌道 (超賣)，或布林張口且帶量突破上軌。
+   - 賣出：觸及上軌出現反轉訊號，或跌破中軌。
+   - 擠壓 (Squeeze)：帶寬變窄預示大行情。
+5. RSI：參考輔助，低於 30 為超賣，高於 70 為超買。
 
-DEFAULT_TICKERS = "AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, NFLX, AMD, INTC"
-tickers_input = st.text_area("輸入要掃描的股票代碼 (用逗號分隔)", value=DEFAULT_TICKERS)
+【你的任務】
+根據提供的數據，給出：
+1. **趨勢分析**：綜合 K 線、布林、KD、成交量判斷目前趨勢。
+2. **具體建議**：明確指出是「觀望」、「買進佈局」還是「減碼賣出」。
+3. **關鍵價格**：
+   - **建議買入價**：基於支撐位或突破點。
+   - **建議停損價**：基於前低或布林下軌/中軌。
+4. **未來發展預測**：簡述原因。
+"""
 
-# --- 函式區 ---
-def search_news(symbol):
+# --- 核心函式 ---
+
+def get_stock_data(symbol):
     try:
-        results = DDGS().text(f"{symbol} stock news financial outlook", max_results=3)
-        if results:
-            return "\n".join([f"- {r['title']}" for r in results])
-        return "無相關新聞"
-    except:
-        return "無法取得即時新聞"
+        # 下載 1 年數據以確保指標計算準確
+        df = yf.download(symbol, period="1y", interval="1d", progress=False)
+        if df.empty: return None
+        
+        # 處理 MultiIndex (yfinance 新版問題)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # 計算指標
+        # 1. RSI
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        # 2. 布林通道
+        bb = ta.bbands(df['Close'], length=20, std=2)
+        df = pd.concat([df, bb], axis=1)
+        # 3. KD (Stochastics)
+        stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=9, d=3)
+        df = pd.concat([df, stoch], axis=1)
+        
+        # 重新命名方便存取
+        df.rename(columns={
+            'BBL_20_2.0': 'BB_Lower', 
+            'BBM_20_2.0': 'BB_Mid', 
+            'BBU_20_2.0': 'BB_Upper',
+            'STOCHk_9_3_3': 'K',
+            'STOCHd_9_3_3': 'D'
+        }, inplace=True)
+        
+        return df.tail(120) # 只回傳最近半年供繪圖
+    except Exception as e:
+        st.error(f"數據抓取失敗: {e}")
+        return None
 
-def ask_gemini(stock_info, news):
-    if not GEMINI_API_KEY: return "請先設定 API Key"
+def plot_interactive_chart(df, symbol):
+    # 建立子圖：主圖(K線+布林), 成交量, KD/RSI
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, 
+                        row_heights=[0.6, 0.2, 0.2],
+                        subplot_titles=(f'{symbol} 日線圖 (布林通道)', '成交量', 'KD指標'))
+
+    # 1. 主圖：K線 (紅漲綠跌)
+    fig.add_trace(go.Candlestick(x=df.index,
+                    open=df['Open'], high=df['High'],
+                    low=df['Low'], close=df['Close'],
+                    name='K線',
+                    increasing_line_color='red', decreasing_line_color='green'), row=1, col=1)
+
+    # 布林通道線
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', width=1), name='上軌'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Mid'], line=dict(color='orange', width=1), name='中軌(20MA)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', width=1), name='下軌'), row=1, col=1)
+
+    # 2. 成交量 (顏色跟隨漲跌)
+    colors = ['red' if row['Open'] < row['Close'] else 'green' for i, row in df.iterrows()]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
+
+    # 3. KD 指標
+    fig.add_trace(go.Scatter(x=df.index, y=df['K'], line=dict(color='blue', width=1.5), name='K值'), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['D'], line=dict(color='orange', width=1.5), name='D值'), row=3, col=1)
+    # 畫出 80/20 參考線
+    fig.add_hline(y=80, line_dash="dash", line_color="gray", row=3, col=1)
+    fig.add_hline(y=20, line_dash="dash", line_color="gray", row=3, col=1)
+
+    fig.update_layout(height=800, xaxis_rangeslider_visible=False, title_text=f"{symbol} 技術分析圖表")
+    return fig
+
+def ask_gemini_analysis(symbol, df):
+    if not GEMINI_API_KEY: return "請先輸入 API Key"
+    
+    # 提取最新一筆數據
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # 構建數據摘要
+    data_summary = f"""
+    【{symbol} 最新數據 ({last.name.date()})】
+    - 收盤價: {last['Close']:.2f} (前日: {prev['Close']:.2f})
+    - 成交量: {int(last['Volume'])} (前日: {int(prev['Volume'])})
+    - RSI(14): {last['RSI']:.2f}
+    - KD指標: K={last['K']:.2f}, D={last['D']:.2f} (前日 K={prev['K']:.2f}, D={prev['D']:.2f})
+    - 布林通道: 上軌={last['BB_Upper']:.2f}, 中軌={last['BB_Mid']:.2f}, 下軌={last['BB_Lower']:.2f}
+    - 價格位置: 距離下軌 {(last['Close'] - last['BB_Lower']):.2f}, 距離上軌 {(last['BB_Upper'] - last['Close']):.2f}
+    """
+
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
     
-    prompt = f"""
-    分析目標：{stock_info['symbol']} (RSI: {stock_info['rsi']}, 現價: {stock_info['price']})
-    新聞標題：{news}
-    請用繁體中文，扮演分析師，150字內分析：
-    1. 為何最近下跌？
-    2. 現在適合買進嗎？
-    3. 未來展望。
-    """
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(STRATEGY_CONTEXT + "\n\n" + data_summary)
         return response.text
     except Exception as e:
-        return f"AI 分析失敗: {e}"
+        return f"AI 分析錯誤: {e}"
 
-def send_email(html_content, recipient):
-    if not GMAIL_USER or not GMAIL_PASSWORD: return False, "未設定 Gmail 帳密"
-    msg = MIMEMultipart()
-    msg['Subject'] = f'【AI 投資週報】{datetime.now().strftime("%Y-%m-%d")}'
-    msg['From'] = GMAIL_USER
-    msg['To'] = recipient
-    msg.attach(MIMEText(html_content, 'html'))
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
-            s.login(GMAIL_USER, GMAIL_PASSWORD)
-            s.send_message(msg)
-        return True, "成功"
-    except Exception as e:
-        return False, str(e)
+# --- 主介面 ---
+st.title("📈 AI 美股技術分析：日線級別")
+st.markdown("結合 **K線型態、布林通道、KD、RSI** 與 **成交量** 的全方位健診系統。")
 
-# --- 執行按鈕 ---
-if st.button("🚀 啟動分析", type="primary"):
-    status_text = st.empty()
-    bar = st.progress(0)
-    ticker_list = [x.strip() for x in tickers_input.split(',')]
-    oversold = []
+col1, col2 = st.columns([3, 1])
+with col1:
+    symbol = st.text_input("請輸入美股代號 (例如: TSLA, NVDA, AAPL)", value="TSLA").upper()
+with col2:
+    analyze_btn = st.button("🚀 開始分析", type="primary", use_container_width=True)
 
-    status_text.text("正在掃描數據...")
-    for i, sym in enumerate(ticker_list):
-        try:
-            df = yf.download(sym, period="3mo", progress=False)
-            if len(df) > 14:
-                # 簡單處理 Series 數據格式問題
-                close_val = df['Close'].iloc[-1]
-                current_price = float(close_val.item()) if hasattr(close_val, 'item') else float(close_val)
-                
-                rsi_series = ta.rsi(df['Close'], length=14)
-                if rsi_series is not None and not rsi_series.empty:
-                    rsi_val = rsi_series.iloc[-1]
-                    current_rsi = float(rsi_val.item()) if hasattr(rsi_val, 'item') else float(rsi_val)
-                    
-                    # 篩選條件 (RSI < 45)
-                    if current_rsi < 45:  
-                        oversold.append({'symbol': sym, 'price': round(current_price, 2), 'rsi': round(current_rsi, 2)})
-        except Exception as e:
-            print(f"跳過 {sym}: {e}")
-        bar.progress((i+1)/len(ticker_list))
-
-    if not oversold:
-        st.warning("目前市場沒有符合超賣條件 (RSI < 45) 的股票。")
-        st.stop()
-
-    # 取前5名並分析
-    oversold.sort(key=lambda x: x['rsi'])
-    top_5 = oversold[:5]
-    
-    report_html = "<h2>AI 分析報告</h2><hr>"
-    for stock in top_5:
-        with st.spinner(f"正在分析 {stock['symbol']} ..."):
-            news = search_news(stock['symbol'])
-            analysis = ask_gemini(stock, news)
+if analyze_btn and symbol:
+    with st.spinner(f"正在抓取 {symbol} 數據並計算指標..."):
+        df = get_stock_data(symbol)
+        
+        if df is not None:
+            # 1. 顯示互動圖表
+            st.plotly_chart(plot_interactive_chart(df, symbol), use_container_width=True)
             
-            # 顯示在網頁
-            with st.expander(f"📊 {stock['symbol']} (RSI: {stock['rsi']})", expanded=True):
-                st.markdown(f"**現價:** ${stock['price']}")
-                st.info(analysis)
-            
-            # 寫入 Email HTML
-            report_html += f"""
-            <div style="margin-bottom:15px; border-bottom:1px solid #ccc; padding-bottom:10px;">
-                <h3 style="color:#2e86c1;">{stock['symbol']} (RSI: {stock['rsi']})</h3>
-                <p><b>現價:</b> ${stock['price']}</p>
-                <p>{analysis.replace(chr(10), '<br>')}</p>
-            </div>
-            """
+            # 2. 顯示最新數據快照
+            last_row = df.iloc[-1]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("RSI (14)", f"{last_row['RSI']:.1f}", delta_color="off")
+            c2.metric("K值 (9)", f"{last_row['K']:.1f}")
+            c3.metric("D值 (3)", f"{last_row['D']:.1f}")
+            c4.metric("布林寬度", f"{(last_row['BB_Upper']-last_row['BB_Lower']):.2f}")
 
-    if GMAIL_USER:
-        status_text.text("正在寄送郵件...")
-        ok, msg = send_email(report_html, TARGET_EMAIL)
-        if ok: 
-            st.success(f"✅ 報告已寄出至 {TARGET_EMAIL}")
-            st.balloons()
-        else: 
-            st.error(f"❌ 寄信失敗: {msg}")
+            # 3. AI 分析
+            st.subheader("🤖 AI 策略分析報告")
+            with st.spinner("AI 正在根據您的策略進行判斷..."):
+                analysis_result = ask_gemini_analysis(symbol, df)
+                st.markdown(f"""
+                <div style="background-color:#f8f9fa; padding:20px; border-radius:10px; border-left: 5px solid #ff4b4b;">
+                    {analysis_result.replace(chr(10), '<br>')}
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.error("查無此代號或數據獲取失敗，請確認代號正確。")
