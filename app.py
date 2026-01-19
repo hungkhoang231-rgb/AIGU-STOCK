@@ -53,36 +53,40 @@ STRATEGY_CONTEXT = """
 
 def get_stock_data(symbol):
     try:
-        # 下載 1 年數據以確保指標計算準確
+        # 下載 1 年數據
         df = yf.download(symbol, period="1y", interval="1d", progress=False)
-        if df.empty: return None
         
-        # 處理 MultiIndex (yfinance 新版問題)
+        # 【修正 1】處理 yfinance 新版格式 (MultiIndex)
+        # 如果欄位是多層的 (例如: ('Close', 'AAPL'))，把它攤平
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
+        if df.empty: return None
+        
         # 計算指標
         # 1. RSI
         df['RSI'] = ta.rsi(df['Close'], length=14)
-        # 2. 布林通道
+        
+        # 【修正 2】更安全的布林通道計算方式
+        # 我們不依賴自動產生的欄位名稱，而是直接重新命名結果
         bb = ta.bbands(df['Close'], length=20, std=2)
-        df = pd.concat([df, bb], axis=1)
+        
+        # pandas_ta 的 bbands 回傳順序固定是: Lower, Mid, Upper, Bandwidth, Percent
+        # 我們直接強制改名，這樣就不會發生 KeyError
+        if bb is not None:
+            bb.columns = ['BB_Lower', 'BB_Mid', 'BB_Upper', 'BB_Bandwidth', 'BB_Percent']
+            df = pd.concat([df, bb], axis=1)
+        
         # 3. KD (Stochastics)
         stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=9, d=3)
-        df = pd.concat([df, stoch], axis=1)
+        # 同樣處理 KD 的欄位名稱
+        if stoch is not None:
+            stoch.columns = ['K', 'D'] 
+            df = pd.concat([df, stoch], axis=1)
         
-        # 重新命名方便存取
-        df.rename(columns={
-            'BBL_20_2.0': 'BB_Lower', 
-            'BBM_20_2.0': 'BB_Mid', 
-            'BBU_20_2.0': 'BB_Upper',
-            'STOCHk_9_3_3': 'K',
-            'STOCHd_9_3_3': 'D'
-        }, inplace=True)
-        
-        return df.tail(120) # 只回傳最近半年供繪圖
+        return df.tail(120) 
     except Exception as e:
-        st.error(f"數據抓取失敗: {e}")
+        st.error(f"數據抓取失敗 ({symbol}): {e}")
         return None
 
 def plot_interactive_chart(df, symbol):
@@ -182,3 +186,4 @@ if analyze_btn and symbol:
                 """, unsafe_allow_html=True)
         else:
             st.error("查無此代號或數據獲取失敗，請確認代號正確。")
+
